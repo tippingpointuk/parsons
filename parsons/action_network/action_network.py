@@ -4,6 +4,8 @@ import re
 from parsons.utilities import check_env
 from parsons.utilities.api_connector import APIConnector
 import logging
+from ratelimit import limits, RateLimitException
+from backoff import on_exception, expo
 
 logger = logging.getLogger(__name__)
 
@@ -26,20 +28,47 @@ class ActionNetwork(object):
         self.api_url = API_URL
         self.api = APIConnector(self.api_url, headers=self.headers)
 
-    def _get_page(self, object_name, page, per_page=25, filter=None):
+    # Action Network has a 4 per second rate limit, see
+    # https://actionnetwork.org/docs/#considerations
+    @on_exception(expo, RateLimitException, max_tries=8)
+    @limits(calls=4, period=1)
+    def _get_page(self, object_name, page, per_page=25, filter=None, object_parent={}):
+        """
+        `Args:`
+            object_name:
+                The number of entries to return. When None, returns all entries.
+            per_page
+                The number of entries per page to return. 25 maximum.
+            page
+                Which page of results to return
+            filter
+                The OData query for filtering results. E.g. "modified_date gt '2014-03-25'".
+                When None, no filter is applied.
+            object_parent
+                A dict of the parent object, with keys name and id, to prepend the
+                request. E.g. {'name': 'people', 'id':'an_action_network_id_12345'}
+                where object_name is "attendances" or "tags"
+        `Returns:`
+            A page of up to 25 results of a specific object type
+        """
         # returns data from one page of results
         if per_page > 25:
             per_page = 25
             logger.info("Action Network's API will not return more than 25 entries per page. \
             Changing per_page parameter to 25.")
+        if 'name' in object_parent.keys() and 'id' in object_parent.keys():
+            url = f"{object_parent['name']}/{object_parent['id']}/{object_name}"
+        else:
+            url = object_name
         params = {
             "page": page,
             "per_page": per_page,
             "filter": filter
         }
-        return self.api.get_request(url=object_name, params=params)
+        return self.api.get_request(url=url, params=params)
 
-    def _get_entry_list(self, object_name, limit=None, per_page=25, filter=None):
+    def _get_entry_list(self, object_name, limit=None, per_page=25, filter=None,
+                        object_parent={}):
         # returns a list of entries for a given object, such as people, tags, or actions
         # Filter can only be applied to people, petitions, events, forms, fundraising_pages,
         # event_campaigns, campaigns, advocacy_campaigns, signatures, attendances, submissions,
@@ -49,7 +78,8 @@ class ActionNetwork(object):
         page = 1
         return_list = []
         while True:
-            response = self._get_page(object_name, page, per_page, filter=filter)
+            response = self._get_page(object_name, page, per_page,
+                                      filter=filter, object_parent=object_parent)
             page = page + 1
             response_list = response['_embedded'][f"osdi:{object_name}"]
             if not response_list:
